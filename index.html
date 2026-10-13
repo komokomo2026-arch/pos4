@@ -336,6 +336,13 @@
       .qa-grid { max-width:520px; }
       .modal-content { margin:8vh auto; }
     }
+    .bk-auto { display:flex; align-items:center; gap:8px; font-size:11px; font-weight:600; color:var(--muted); white-space:nowrap; margin-top:3px; }
+    .bk-sw { position:relative; width:42px; height:24px; border-radius:999px; background:#c3cdc8; cursor:pointer; transition:background .2s; flex-shrink:0; }
+    .bk-sw::after { content:''; position:absolute; top:3px; left:3px; width:18px; height:18px; border-radius:50%; background:#fff; transition:transform .2s; box-shadow:0 1px 3px rgba(0,0,0,.25); }
+    .bk-sw.on { background:var(--primary); }
+    .bk-sw.on::after { transform:translateX(18px); }
+    .bk-sw.busy { opacity:.6; pointer-events:none; }
+    .bk-sw:focus-visible { outline:2px solid var(--primary); outline-offset:2px; }
     button, .qa-item, .nav-item, .more-item, .sidebar-nav-item { touch-action:manipulation; }
     @media (prefers-reduced-motion:reduce) { * { animation-duration:.01ms !important; transition-duration:.01ms !important; } }
   </style>
@@ -619,16 +626,24 @@
       <!-- BACK UP (More → Back Up) — optional Google Drive backup -->
       <div id="backupView" class="view">
         <div class="card">
-          <div class="page-title"><i class="fas fa-cloud-arrow-up"></i> Back Up</div>
+          <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+            <div class="page-title"><i class="fas fa-cloud-arrow-up"></i> Back Up</div>
+            <div class="bk-auto"><span>Automatic Backup</span><div id="bkAutoSwitch" class="bk-sw" role="switch" aria-checked="false" aria-label="Automatic Backup" tabindex="0" onclick="bkToggleAuto()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();bkToggleAuto();}"></div></div>
+          </div>
           <p class="page-sub">Optional Google Drive backup. The app works fully without it.</p>
           <div id="bkStatus" class="info-p"></div>
           <button id="btnBkConnect" onclick="bkConnect()" style="display:none"><i class="fab fa-google"></i> Connect Google Account</button>
+          <div id="bkFolderLocked" style="display:none">
+            <label class="lbl">Backup folder (saved permanently)</label>
+            <div class="info-p" style="background:#f6f9f7;border:1px solid #e3e9e5;border-radius:12px;padding:12px 14px;margin:6px 0 0;word-break:break-word"><i class="fas fa-lock" style="color:#09874a;margin-right:8px"></i><strong id="bkFolderNameText"></strong></div>
+          </div>
           <div id="bkFolderBox" style="display:none">
             <label class="lbl">Backup folder name</label>
             <input type="text" id="bkFolderName" placeholder="e.g. My Business Backup">
-            <button id="btnBkFolder" onclick="bkSetFolder()" style="margin-top:8px"><i class="fas fa-folder-plus"></i> Use / Create Folder</button>
+            <button id="btnBkFolder" onclick="bkSetFolder()" style="margin-top:8px"><i class="fas fa-folder-plus"></i> Save Folder</button>
           </div>
           <div id="bkActions" style="display:none">
+            <div id="bkAutoHint" class="page-sub" style="display:none;margin:10px 0 0"><i class="fas fa-circle-info"></i> Automatic backup is ON. Tapping Manual Backup turns it OFF first, then backs up once.</div>
             <button id="btnBkManual" onclick="bkManual()" style="margin-top:12px"><i class="fas fa-cloud-arrow-up"></i> Manual Backup</button>
             <button id="btnBkRestore" onclick="bkRestore()" style="margin-top:8px;background:#0f172a"><i class="fas fa-cloud-arrow-down"></i> Restore</button>
           </div>
@@ -1139,7 +1154,7 @@ function showView(id) {
   $('[data-view="' + navKey + '"]').addClass('active');
   $('#desktopViewTitle').text(VIEW_TITLES[id] || '');
   if (id === 'bizView') fillBizForm();
-  if (id === 'backupView') refreshBackupUI();
+  if (id === 'backupView') { refreshBackupUI(); bkReloadState().then(function() { refreshBackupUI(); bkTrySilent(); }); }
   window.scrollTo({ top: 0 });
   $('.main-wrapper').scrollTop(0);
 }
@@ -1783,9 +1798,10 @@ function handleSaleScan(code) {
      by a restore.
 ═══════════════════════════════════════════════════════════════ */
 const BK_APP_ID = 'EkambaniPOS';
-let driveState = { key: 'drive', folderId: '', folderName: '', fileId: '', syncedFileId: '', accountEmail: '', lastBackup: 0, dirty: false };
+let driveState = { key: 'drive', connected: false, autoBackup: false, folderId: '', folderName: '', fileId: '', syncedFileId: '', accountEmail: '', lastBackup: 0, dirty: false, dirtyAt: 0 };
 let gdToken = { value: '', exp: 0 };
 let _gisPromise = null, _bkBusy = false, _bkTimer = null, _bkFails = 0, _dirtySeq = 0;
+let _bkNote = '', _bkError = '', _needsAuth = false, _silentBusy = false, _silentAt = 0, _folderBusy = false, _bkChain = Promise.resolve();
 
 function gdConfigured() {
   const id = (GDRIVE_CONFIG.CLIENT_ID || '').trim();
@@ -1794,39 +1810,74 @@ function gdConfigured() {
 function gdEnvOk() { return location.protocol === 'https:' || (location.protocol === 'http:' && /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname)); }
 function gdTokenValid() { return !!gdToken.value && Date.now() < gdToken.exp - 60000; }
 function bkReady() { return gdConfigured() && gdEnvOk() && !!driveState.folderId; }
+/* Automatic backup is really enabled only when ALL of these hold (the toggle mirrors exactly this). */
+function bkAutoReady() { return bkReady() && !!driveState.connected && !!driveState.autoBackup; }
+function bkRefreshIfOpen() { if ($('#backupView').hasClass('active')) refreshBackupUI(); }
 
 async function bkInit() {
   const s = await dbGet('settings', 'drive');
-  if (s) driveState = Object.assign(driveState, s, { key: 'drive' });
-  window.addEventListener('online', function() { if (driveState.dirty) bkSchedule(3000); });
-  if (driveState.dirty && bkReady()) bkSchedule(5000);
+  if (s) {
+    driveState = Object.assign(driveState, s, { key: 'drive' });
+    // Records saved before the "connected" flag existed: treat a known account as connected (the token is re-checked honestly below).
+    if (s.connected === undefined && s.accountEmail) driveState.connected = true;
+  }
+  window.addEventListener('online', function() {
+    if (driveState.dirty && bkAutoReady()) bkSchedule(3000);
+    if (driveState.connected) bkTrySilent();
+  });
+  if (driveState.dirty && bkAutoReady()) bkSchedule(5000);
+  if (driveState.connected && gdConfigured() && gdEnvOk()) setTimeout(bkTrySilent, 2500);
 }
 function saveDriveState() { return dbPut('settings', driveState); }
+/* Re-read the saved connection record (another tab may have changed it). Never loses a pending-change flag. */
+async function bkReloadState() {
+  try {
+    const cur = await dbGet('settings', 'drive');
+    if (cur) {
+      const dirty = !!(cur.dirty || driveState.dirty);
+      const dirtyAt = Math.max(cur.dirtyAt || 0, driveState.dirtyAt || 0);
+      driveState = Object.assign(driveState, cur, { key: 'drive', dirty: dirty, dirtyAt: dirtyAt });
+    }
+  } catch (e) {}
+}
 
-/* Mark local data as changed since the last backup, then schedule a quiet auto backup. */
+/* Mark local data as changed since the last successful backup; schedule an auto backup only if it is really ON. */
 function markDirty() {
   _dirtySeq++;
   if (!driveState.folderId) return;
-  if (!driveState.dirty) { driveState.dirty = true; saveDriveState().catch(function() {}); }
-  bkSchedule();
+  driveState.dirty = true; driveState.dirtyAt = Date.now();
+  saveDriveState().catch(function() {});
+  if (bkAutoReady()) bkSchedule();
 }
 function bkSchedule(delay) {
   clearTimeout(_bkTimer);
-  if (!bkReady()) return;
+  if (!bkAutoReady()) return;
   _bkTimer = setTimeout(bkAuto, delay == null ? GDRIVE_CONFIG.AUTO_BACKUP_DELAY_MS : delay);
 }
 async function bkAuto() {
-  if (!bkReady() || !driveState.dirty || !navigator.onLine || _bkBusy) return;
+  if (!bkAutoReady() || !driveState.dirty || !navigator.onLine) return;
   try {
     const r = await bkRun(false);
-    _bkFails = 0;
-    if (r === 'skipped') return;
-    if ($('#backupView').hasClass('active')) refreshBackupUI();
+    if (r === 'ok') _bkFails = 0;
+    // Changes made while the upload was running keep the flag set: back up again shortly.
+    if (r === 'ok' && driveState.dirty && bkAutoReady()) bkSchedule(2000);
   } catch (e) {
     console.warn('Auto backup failed (local data is safe):', e && e.message);
     _bkFails++;
-    if (navigator.onLine) bkSchedule(Math.min(120000 * Math.pow(2, _bkFails - 1), 1800000));
-  }
+    // Needs the user to renew Google access: do not loop; retry on reconnect/online/renew instead.
+    if (!(e && e.needsAuth) && navigator.onLine && bkAutoReady()) bkSchedule(Math.min(120000 * Math.pow(2, _bkFails - 1), 1800000));
+  } finally { bkRefreshIfOpen(); }
+}
+/* Quietly renew the access token (no popup unless Google needs it; browsers may block popups without a tap). */
+async function bkTrySilent() {
+  if (!driveState.connected || gdTokenValid() || _silentBusy || !navigator.onLine || !gdConfigured() || !gdEnvOk()) return;
+  if (Date.now() - _silentAt < 30000) return;
+  _silentBusy = true; _silentAt = Date.now();
+  try {
+    await gdRequestToken('');
+    if (driveState.dirty && bkAutoReady()) bkSchedule(1500);
+  } catch (e) { if (e && e.needsAuth) _needsAuth = true; }
+  finally { _silentBusy = false; bkRefreshIfOpen(); }
 }
 
 /* ── Google sign-in (Google Identity Services, token flow) ── */
@@ -1846,19 +1897,23 @@ function gdRequestToken(prompt) {
   if (!gdConfigured()) return Promise.reject(new Error('Google Drive is not configured.'));
   if (!gdEnvOk()) return Promise.reject(new Error('Google sign-in needs https:// or localhost.'));
   if (!navigator.onLine) return Promise.reject(new Error('No internet connection.'));
+  const authErr = function(m) { const e = new Error(m); e.needsAuth = true; return e; };
   return gdLoadGIS().then(function() {
     return new Promise(function(resolve, reject) {
-      const timer = setTimeout(function() { reject(new Error('Sign-in timed out.')); }, 60000);
+      const timer = setTimeout(function() { reject(authErr('Sign-in timed out.')); }, 60000);
       const client = google.accounts.oauth2.initTokenClient({
         client_id: GDRIVE_CONFIG.CLIENT_ID.trim(),
         scope: GDRIVE_CONFIG.SCOPES,
+        hint: driveState.accountEmail || undefined,
         callback: function(r) {
           clearTimeout(timer);
-          if (!r || r.error || !r.access_token) { reject(new Error((r && (r.error_description || r.error)) || 'Sign-in failed.')); return; }
+          if (!r || r.error || !r.access_token) { reject(authErr((r && (r.error_description || r.error)) || 'Sign-in failed.')); return; }
+          // Access token is kept in memory only (never written to storage); it is renewed on demand.
           gdToken = { value: r.access_token, exp: Date.now() + (Number(r.expires_in) || 3600) * 1000 };
+          _needsAuth = false;
           resolve(gdToken.value);
         },
-        error_callback: function(e) { clearTimeout(timer); reject(new Error('Sign-in cancelled' + (e && e.type ? ' (' + e.type + ')' : '') + '.')); }
+        error_callback: function(e) { clearTimeout(timer); reject(authErr('Sign-in cancelled' + (e && e.type ? ' (' + e.type + ')' : '') + '.')); }
       });
       client.requestAccessToken({ prompt: prompt });
     });
@@ -1866,17 +1921,24 @@ function gdRequestToken(prompt) {
 }
 async function bkEnsureToken(interactive) {
   if (gdTokenValid()) return;
-  await gdRequestToken(interactive ? (driveState.accountEmail ? '' : 'select_account') : '');
+  await gdRequestToken(interactive && !driveState.connected ? 'select_account' : '');
 }
 
 /* ── Drive REST helpers ── */
 async function gdFetch(url, opts) {
   opts = opts || {};
   opts.headers = Object.assign({}, opts.headers, { Authorization: 'Bearer ' + gdToken.value });
-  const r = await fetch(url, opts);
+  let r;
+  try { r = await fetch(url, opts); }
+  catch (err) { const e = new Error('Network problem. Check your internet connection.'); e.network = true; throw e; }
   if (!r.ok) {
-    const e = new Error('Google Drive error ' + r.status); e.status = r.status;
-    if (r.status === 401) gdToken = { value: '', exp: 0 };
+    let m = 'Google Drive error ' + r.status + '.';
+    const e = new Error(m); e.status = r.status;
+    if (r.status === 401) { gdToken = { value: '', exp: 0 }; e.needsAuth = true; e.message = 'Google session expired. Please renew the connection.'; }
+    else if (r.status === 403) e.message = 'Google Drive refused the request (permission or storage quota). Try again later.';
+    else if (r.status === 404) e.message = 'Item not found in Google Drive.';
+    else if (r.status === 429) e.message = 'Google Drive rate limit reached. It will be retried later.';
+    else if (r.status >= 500) e.message = 'Google Drive is temporarily unavailable. It will be retried later.';
     throw e;
   }
   return r;
@@ -1902,16 +1964,15 @@ async function gdCreateFolder(name) {
   });
   return r.json();
 }
+/* Verifies the SAVED folder ID. It never creates a new folder and never changes the saved ID/name. */
 async function gdEnsureFolder() {
-  if (!driveState.folderId) throw new Error('Choose a backup folder first.');
+  if (!driveState.folderId) throw new Error('Save a backup folder first.');
   try {
     const r = await gdFetch(GDRIVE_CONFIG.DRIVE_API + '/files/' + encodeURIComponent(driveState.folderId) + '?fields=id,trashed');
     const j = await r.json();
-    if (!j.trashed) return driveState.folderId;
-  } catch (e) { if (e.status !== 404) throw e; }
-  driveState.folderId = ''; driveState.fileId = ''; driveState.syncedFileId = '';
-  await saveDriveState();
-  throw new Error('Backup folder not found. Please choose the folder again.');
+    if (j && !j.trashed) return driveState.folderId;
+  } catch (e) { if (e.status !== 404 && e.status !== 403) throw e; }
+  throw new Error('Your backup folder "' + (driveState.folderName || 'saved folder') + '" is not available (it may be in the Bin, or this Google account cannot access it). Nothing was changed.');
 }
 async function gdFindBackupFile() {
   const q = "'" + gdQ(driveState.folderId) + "' in parents and name='" + gdQ(GDRIVE_CONFIG.BACKUP_FILE_NAME) + "' and trashed=false";
@@ -1965,112 +2026,174 @@ function bkApply(snap) {
   });
 }
 
-/* ── Backup run (auto + manual) ── */
-async function bkRun(interactive) {
-  if (_bkBusy) return 'busy';
-  _bkBusy = true;
+/* ── Backup run (auto + manual) ──
+   All uploads go through ONE queue (and a cross-tab Web Lock when available), so two backups can never run at the same time. */
+function bkRun(interactive) {
+  const job = function() { return bkRunInner(interactive); };
+  const exec = function() { return (navigator.locks && navigator.locks.request) ? navigator.locks.request('ekambani-drive-backup', job) : job(); };
+  const p = _bkChain.then(exec);
+  _bkChain = p.catch(function() {});
+  return p;
+}
+async function bkRunInner(interactive) {
+  await bkReloadState();
+  if (!interactive && !driveState.autoBackup) return 'off';     // switched OFF while this job was waiting
+  if (!driveState.connected) throw new Error('Google account is not connected.');
+  _bkBusy = true; _bkError = ''; _bkNote = ''; bkRefreshIfOpen();
   try {
     await bkEnsureToken(interactive);
     await gdEnsureFolder();
-    let fileId = driveState.fileId || await gdFindBackupFile();
+    const fileId = driveState.fileId || await gdFindBackupFile();
     // Safety: never silently overwrite a cloud backup this device has not synced with
     // (e.g. a new, empty device connected to an account that already has a backup).
     if (fileId && driveState.syncedFileId !== fileId) {
-      if (!interactive) return 'skipped';
+      if (!interactive) { _bkNote = 'A backup already exists in the folder. Use Restore, or run one Manual Backup, to sync this device before automatic backups continue.'; return 'skipped'; }
       const ok = await Swal.fire({ title: 'Replace existing cloud backup?', text: 'A backup already exists in this folder and this device has not restored it. If this device is new, use Restore first. Replace it with this device\'s data?', icon: 'warning', showCancelButton: true, confirmButtonColor: '#d33' });
       if (!ok.isConfirmed) return 'cancelled';
     }
-    const seq = _dirtySeq;
-    const text = JSON.stringify(await bkSnapshot());
+    const t0 = Date.now(), seq = _dirtySeq;
+    const text = JSON.stringify(await bkSnapshot());       // same full-snapshot format for manual and automatic backups
     let newId;
     try { newId = await gdUpload(text, fileId); }
     catch (e) { if (fileId && e.status === 404) newId = await gdUpload(text, ''); else throw e; }
+    // Only now is the backup really in Google Drive.
     driveState.fileId = newId; driveState.syncedFileId = newId; driveState.lastBackup = Date.now();
-    if (seq === _dirtySeq) driveState.dirty = false;
+    let cur = null; try { cur = await dbGet('settings', 'drive'); } catch (e) {}
+    const changedMeanwhile = (seq !== _dirtySeq) || (cur && (cur.dirtyAt || 0) > t0);
+    if (!changedMeanwhile) driveState.dirty = false;
     await saveDriveState();
     return 'ok';
-  } finally { _bkBusy = false; }
+  } catch (e) {
+    _bkError = (e && e.message) || 'Backup failed.';
+    if (e && e.needsAuth) _needsAuth = true;
+    throw e;
+  } finally { _bkBusy = false; bkRefreshIfOpen(); }
 }
 
 /* ── Backup page UI ── */
+function bkRenderToggle() {
+  const on = !!(driveState.autoBackup && driveState.connected && driveState.folderId);
+  $('#bkAutoSwitch').toggleClass('on', on).attr('aria-checked', on ? 'true' : 'false');
+}
 function refreshBackupUI() {
-  const st = $('#bkStatus'), hide = '#btnBkConnect,#bkFolderBox,#bkActions,#btnBkDisc';
-  $(hide).hide();
+  const st = $('#bkStatus');
+  $('#btnBkConnect,#bkFolderBox,#bkActions,#btnBkDisc,#bkFolderLocked,#bkAutoHint').hide();
+  bkRenderToggle();
   if (!gdConfigured()) {
     st.html('<i class="fas fa-circle-info" style="color:#d97706"></i> Google Drive backup is not configured yet. Your data is still saved safely on this device.'); return;
   }
   if (!gdEnvOk()) {
     st.html('<i class="fas fa-circle-info" style="color:#d97706"></i> Google sign-in is not available here (it needs https:// or localhost). Your data is still saved safely on this device.'); return;
   }
-  const lines = [];
-  const connected = gdTokenValid();
-  if (!connected) {
-    lines.push('<i class="fas fa-circle" style="color:#94a3b8;font-size:9px"></i> Not connected' + (driveState.accountEmail ? ' — last used: ' + esc(driveState.accountEmail) : ''));
-    if (driveState.folderName) lines.push('Folder: ' + esc(driveState.folderName));
-    if (driveState.lastBackup) lines.push('Last backup: ' + esc(new Date(driveState.lastBackup).toLocaleString()));
+  const hasFolder = !!driveState.folderId, lines = [];
+  if (hasFolder) { $('#bkFolderNameText').text(driveState.folderName || '(saved folder)'); $('#bkFolderLocked').show(); }
+  if (!driveState.connected) {
+    lines.push('<i class="fas fa-circle" style="color:#94a3b8;font-size:9px"></i> Not connected');
     st.html(lines.join('<br>'));
-    $('#btnBkConnect').show(); if (driveState.accountEmail || driveState.folderId) $('#btnBkDisc').show();
+    $('#btnBkConnect').html('<i class="fab fa-google"></i> Connect Google Account').show();
     return;
   }
   lines.push('<i class="fas fa-circle" style="color:#22c55e;font-size:9px"></i> Connected' + (driveState.accountEmail ? ' as ' + esc(driveState.accountEmail) : ''));
-  if (driveState.folderId) {
-    lines.push('Folder: ' + esc(driveState.folderName || '(selected)'));
-    lines.push('Auto backup: on (runs when online)' + (driveState.dirty ? ' — changes waiting' : ''));
-    lines.push('Last backup: ' + (driveState.lastBackup ? esc(new Date(driveState.lastBackup).toLocaleString()) : 'never'));
+  if (_needsAuth && !gdTokenValid()) {
+    lines.push('<i class="fas fa-triangle-exclamation" style="color:#d97706"></i> Google access needs to be renewed before the next backup.');
+    $('#btnBkConnect').html('<i class="fas fa-rotate"></i> Renew Google Session').show();
+  }
+  if (hasFolder) {
+    lines.push('Automatic backup: ' + (bkAutoReady() ? 'ON' : 'OFF'));
+    if (_bkBusy) lines.push('<i class="fas fa-spinner fa-spin"></i> Saving to Google Drive…');
+    else if (_bkError) lines.push('<i class="fas fa-circle-exclamation" style="color:#dc2626"></i> Last attempt failed: ' + esc(_bkError));
+    else if (_bkNote) lines.push(esc(_bkNote));
+    lines.push('Last successful backup: ' + (driveState.lastBackup ? esc(new Date(driveState.lastBackup).toLocaleString()) : 'never'));
+    if (driveState.dirty) lines.push('Changes not yet backed up' + (bkAutoReady() && !navigator.onLine ? ' — waiting for internet' : ''));
     $('#bkActions').show();
+    if (bkAutoReady()) $('#bkAutoHint').show();
   } else {
-    lines.push('Choose a name for your backup folder to continue.');
+    lines.push('Enter a folder name and tap Save Folder. This can only be done once.');
+    $('#bkFolderBox').show();
   }
   st.html(lines.join('<br>'));
-  if (!$('#bkFolderName').val()) $('#bkFolderName').val(driveState.folderName || '');
-  $('#bkFolderBox').show(); $('#btnBkDisc').show();
+  $('#btnBkDisc').show();
 }
 
 async function bkConnect() {
   btnLoad('btnBkConnect', 'Connecting...');
   try {
-    await gdRequestToken('select_account');
+    await gdRequestToken(driveState.connected ? '' : 'select_account');
     const email = await gdAccountEmail();
-    if (driveState.accountEmail && email && email.toLowerCase() !== driveState.accountEmail.toLowerCase()) {
-      // Different Google account: the old folder ID belongs to someone else, so forget it.
-      driveState.folderId = ''; driveState.folderName = ''; driveState.fileId = ''; driveState.syncedFileId = ''; driveState.lastBackup = 0;
-      $('#bkFolderName').val('');
-    }
     if (email) driveState.accountEmail = email;
+    driveState.connected = true; _bkError = '';
     await saveDriveState();
     toast('Google account connected', 'success');
-    if (driveState.dirty) bkSchedule(3000);
+    if (driveState.folderId) {
+      try { await gdEnsureFolder(); } catch (e) { _bkError = e.message; toast(e.message, 'error', 7000); }
+    }
+    if (driveState.dirty && bkAutoReady()) bkSchedule(3000);
+    if (!$('#backupView').hasClass('active')) showView('backupView');
   } catch (e) { toast(e.message || 'Could not connect', 'error', 5000); }
   btnReset('btnBkConnect'); refreshBackupUI();
 }
 
+/* One permanent folder: saved once, then locked. Guarded against double taps, refreshes and other tabs. */
 async function bkSetFolder() {
+  if (_folderBusy) return;
+  if (driveState.folderId) { toast('The backup folder is already saved and cannot be changed.', 'info'); refreshBackupUI(); return; }
   const name = ($('#bkFolderName').val() || '').trim();
   if (!name) { toast('Enter a folder name', 'warning'); return; }
-  btnLoad('btnBkFolder', 'Working...');
+  const ok = await Swal.fire({ title: 'Save this backup folder?', text: '"' + name + '" will become your permanent backup folder. It cannot be changed later.', icon: 'question', showCancelButton: true });
+  if (!ok.isConfirmed) return;
+  if (_folderBusy) return;
+  _folderBusy = true; btnLoad('btnBkFolder', 'Saving...');
   try {
     await bkEnsureToken(true);
+    // Another tab (or an earlier tap) may already have saved a folder: reuse it, never create another.
+    const cur = await dbGet('settings', 'drive');
+    if (cur && cur.folderId) { driveState = Object.assign(driveState, cur, { key: 'drive' }); toast('A backup folder is already saved: ' + (cur.folderName || ''), 'info', 5000); return; }
     if (!driveState.accountEmail) { const em = await gdAccountEmail(); if (em) driveState.accountEmail = em; }
+    // First save only (no stored ID yet): reuse an app-created folder of this name (e.g. when moving to a new device), else create it.
     let f = await gdFindFolderByName(name), created = false;
     if (!f) { f = await gdCreateFolder(name); created = true; }
-    if (f.id !== driveState.folderId) { driveState.fileId = ''; driveState.syncedFileId = ''; }
-    driveState.folderId = f.id; driveState.folderName = name;
+    driveState.folderId = f.id; driveState.folderName = f.name || name; driveState.fileId = ''; driveState.syncedFileId = '';
     await saveDriveState();
-    toast(created ? 'Folder created' : 'Existing folder selected', 'success');
-    if (!created) {
-      try { if (await gdFindBackupFile()) toast('A backup was found in this folder. Tap Restore to load it.', 'info', 5000); } catch (e) {}
-    }
-  } catch (e) { toast(e.message || 'Could not set folder', 'error', 5000); }
-  btnReset('btnBkFolder'); refreshBackupUI();
+    toast(created ? 'Folder saved' : 'Existing folder saved', 'success');
+    try { if (!created && await gdFindBackupFile()) toast('A backup was found in this folder. Tap Restore to load it.', 'info', 5000); } catch (e) {}
+  } catch (e) { toast(e.message || 'Could not save folder', 'error', 5000); }
+  finally { _folderBusy = false; btnReset('btnBkFolder'); refreshBackupUI(); }
+}
+
+/* Persist the automatic-backup preference; the in-memory value is rolled back if it could not be saved. */
+async function bkSetAuto(on) {
+  const prev = driveState.autoBackup;
+  driveState.autoBackup = !!on;
+  if (on && !driveState.lastBackup) { driveState.dirty = true; driveState.dirtyAt = Date.now(); }
+  if (!on) clearTimeout(_bkTimer);
+  try { await saveDriveState(); }
+  catch (e) { driveState.autoBackup = prev; throw e; }
+}
+async function bkToggleAuto() {
+  const sw = $('#bkAutoSwitch'); if (sw.hasClass('busy')) return;
+  const want = !(driveState.autoBackup && driveState.connected && driveState.folderId);
+  if (want) {
+    if (!gdConfigured() || !gdEnvOk()) { toast('Google Drive backup is not available here.', 'warning'); return; }
+    if (!driveState.connected) { toast('Connect your Google account first.', 'warning'); return; }
+    if (!driveState.folderId) { toast('Save a backup folder first.', 'warning'); return; }
+  }
+  sw.addClass('busy');
+  try {
+    await bkSetAuto(want);
+    if (want) { toast('Automatic backup is ON', 'success'); if (driveState.dirty) bkSchedule(1500); }
+    else toast('Automatic backup is OFF', 'info');
+  } catch (e) { console.error(e); toast('Could not save the setting', 'error'); }
+  finally { sw.removeClass('busy'); refreshBackupUI(); }
 }
 
 async function bkManual() {
   btnLoad('btnBkManual', 'Backing up...');
   try {
+    // Manual and automatic never compete: switch automatic OFF first (persisted), then queue exactly one manual backup behind any running upload.
+    if (driveState.autoBackup) { await bkSetAuto(false); toast('Automatic backup turned OFF', 'info', 2500); refreshBackupUI(); }
     const r = await bkRun(true);
     if (r === 'ok') toast('Backup saved to Google Drive', 'success');
-    else if (r === 'busy') toast('A backup is already running', 'info');
-  } catch (e) { console.error(e); toast('Backup failed: ' + (e.message || 'unknown error') + '. Your local data is safe.', 'error', 6000); }
+  } catch (e) { console.error(e); toast('Backup failed: ' + (e.message || 'unknown error') + ' Your local data is safe.', 'error', 6000); }
   btnReset('btnBkManual'); refreshBackupUI();
 }
 
@@ -2102,26 +2225,31 @@ async function bkRestore() {
 }
 
 async function bkDisconnect() {
+  const ok = await Swal.fire({ title: 'Disconnect Google account?', text: 'Automatic backup will turn OFF. Your saved backup folder and all local data are kept.', icon: 'warning', showCancelButton: true });
+  if (!ok.isConfirmed) return;
   try { if (gdTokenValid() && window.google && google.accounts && google.accounts.oauth2) google.accounts.oauth2.revoke(gdToken.value, function() {}); } catch (e) {}
   gdToken = { value: '', exp: 0 };
   clearTimeout(_bkTimer);
-  driveState = { key: 'drive', folderId: '', folderName: '', fileId: '', syncedFileId: '', accountEmail: '', lastBackup: 0, dirty: false };
-  try { await dbPut('settings', driveState); } catch (e) {}
-  $('#bkFolderName').val('');
-  toast('Disconnected. Your local data is unchanged.', 'info');
+  const prev = Object.assign({}, driveState);
+  driveState.connected = false; driveState.autoBackup = false; driveState.accountEmail = '';
+  _needsAuth = false; _bkError = ''; _bkNote = '';
+  try { await saveDriveState(); }
+  catch (e) { driveState = prev; toast('Could not disconnect. Please try again.', 'error'); refreshBackupUI(); return; }
+  toast('Disconnected. Your local data and saved folder are unchanged.', 'info');
   refreshBackupUI();
 }
 
 /* Hook data-changing operations so auto backup knows when something changed.
    The wrappers return the original promise untouched; they never alter behavior or results. */
 (function() {
-  const _put = dbPut, _del = dbDelete, _sale = dbSaveSale, _inv = dbDeleteInvoice;
+  const _put = dbPut, _del = dbDelete, _sale = dbSaveSale, _inv = dbDeleteInvoice, _item = dbSaveItem;
   dbPut = function(store, val) {
     const p = _put(store, val);
     if (!(store === 'settings' && val && val.key === 'drive')) p.then(markDirty, function() {});
     return p;
   };
   dbDelete = function(store, key) { const p = _del(store, key); p.then(markDirty, function() {}); return p; };
+  dbSaveItem = function(d) { const p = _item(d); p.then(function(r) { if (r && !r.error) markDirty(); }, function() {}); return p; };
   dbSaveSale = function(d) { const p = _sale(d); p.then(function(r) { if (r && !r.error) markDirty(); }, function() {}); return p; };
   dbDeleteInvoice = function(inv) { const p = _inv(inv); p.then(markDirty, function() {}); return p; };
 })();
